@@ -174,9 +174,9 @@ async fn sync_room(state: &AppState, code: &str) {
         remaining_ms,
     };
 
-    // Auto-enqueue rule: Host playback is active, remaining time <= 12 seconds (12_000 ms),
+    // Auto-enqueue rule: Host playback is active, remaining time <= 20 seconds (20_000 ms),
     // and we haven't already enqueued a song for this current track
-    let is_near_end = is_playing && remaining_ms <= 12_000;
+    let is_near_end = is_playing && remaining_ms <= 20_000;
     let mut song_to_enqueue: Option<(QueueItem, String)> = None;
 
     {
@@ -185,10 +185,19 @@ async fn sync_room(state: &AppState, code: &str) {
             room.currently_playing = Some(currently_playing);
 
             if is_near_end {
-                if room.enqueued_for_track_id.as_deref() != Some(&track_id) {
+                let already_enqueued = room.enqueued_for_track_id.as_deref() == Some(&track_id);
+                if !already_enqueued {
                     room.sort_queue();
                     if !room.queue.is_empty() {
                         let next = room.queue.remove(0);
+                        tracing::info!(
+                            "Near end trigger for room {}: current track '{}' has {}s remaining. Preparing to enqueue '#1' song '{}' ({} votes)...",
+                            code,
+                            item.name,
+                            remaining_ms / 1000,
+                            next.name,
+                            next.votes
+                        );
                         song_to_enqueue = Some((next, track_id.clone()));
                     }
                 }
@@ -213,7 +222,7 @@ async fn sync_room(state: &AppState, code: &str) {
         match queue_res {
             Ok(r) if r.status().is_success() => {
                 tracing::info!(
-                    "Seamless transition: Auto-enqueued '#1' song '{}' into Spotify queue for room {} ({}s remaining in '{}')",
+                    "Seamless transition SUCCESS: Auto-enqueued '#1' song '{}' into Spotify queue for room {} ({}s remaining in '{}')",
                     next_song.name,
                     code,
                     remaining_ms / 1000,
