@@ -13,7 +13,10 @@ use axum::{
     Json, Router,
 };
 use config::AppConfig;
-use room::{create_room, delete_room, get_room, join_room, leave_room};
+use room::{
+    add_to_queue, create_room, delete_room, get_room, join_room, leave_room, remove_from_queue,
+    vote_track,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -88,6 +91,16 @@ async fn main() {
         .route("/api/rooms/{code}", get(get_room).delete(delete_room))
         .route("/api/rooms/{code}/join", post(join_room))
         .route("/api/rooms/{code}/leave", post(leave_room))
+        // Room Queue & Voting
+        .route("/api/rooms/{code}/queue", post(add_to_queue))
+        .route(
+            "/api/rooms/{code}/queue/{track_id}/vote",
+            post(vote_track),
+        )
+        .route(
+            "/api/rooms/{code}/queue/{track_id}",
+            axum::routing::delete(remove_from_queue),
+        )
         // Spotify search
         .route("/api/spotify/search", get(spotify::search_tracks))
         .layer(cors)

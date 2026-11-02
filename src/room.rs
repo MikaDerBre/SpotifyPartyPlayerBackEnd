@@ -5,6 +5,7 @@ use axum::{
 };
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::{extract_session_token, AppState};
@@ -19,13 +20,43 @@ pub struct RoomMember {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueueItem {
+    pub id: String,
+    pub track_id: String,
+    pub name: String,
+    pub uri: String,
+    pub artist_display: String,
+    pub album_name: String,
+    pub album_art: Option<String>,
+    pub duration_ms: u64,
+    pub added_by_name: String,
+    pub added_by_id: String,
+    pub added_at: u64,
+    pub votes: usize,
+    pub voters: HashSet<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Room {
     pub code: String,
     pub name: String,
     pub host_id: String,
     pub host_name: String,
     pub members: Vec<RoomMember>,
+    pub queue: Vec<QueueItem>,
     pub created_at: u64,
+}
+
+impl Room {
+    pub fn sort_queue(&mut self) {
+        self.queue.sort_by(|a, b| {
+            // Sort by votes descending (highest first)
+            b.votes
+                .cmp(&a.votes)
+                // If equal, older added tracks first (FIFO)
+                .then_with(|| a.added_at.cmp(&b.added_at))
+        });
+    }
 }
 
 #[derive(Deserialize)]
@@ -45,6 +76,24 @@ pub struct LeaveRoomRequest {
     pub user_id: String,
 }
 
+#[derive(Deserialize)]
+pub struct AddToQueueRequest {
+    pub track_id: String,
+    pub name: String,
+    pub uri: String,
+    pub artist_display: String,
+    pub album_name: String,
+    pub album_art: Option<String>,
+    pub duration_ms: u64,
+    pub user_id: Option<String>,
+    pub user_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct VoteRequest {
+    pub user_id: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct RoomResponse {
     pub code: String,
@@ -53,6 +102,7 @@ pub struct RoomResponse {
     pub host_name: String,
     pub members: Vec<RoomMember>,
     pub member_count: usize,
+    pub queue: Vec<QueueItem>,
     pub created_at: u64,
 }
 
@@ -65,6 +115,7 @@ impl From<&Room> for RoomResponse {
             host_name: r.host_name.clone(),
             members: r.members.clone(),
             member_count: r.members.len(),
+            queue: r.queue.clone(),
             created_at: r.created_at,
         }
     }
@@ -132,7 +183,7 @@ pub async fn create_room(
         joined_at: now,
     };
 
-    let room = Room {
+    let mut room = Room {
         code: code.clone(),
         name: if payload.name.trim().is_empty() {
             format!("{}'s Party", host_name)
@@ -142,8 +193,10 @@ pub async fn create_room(
         host_id,
         host_name,
         members: vec![host_member],
+        queue: Vec::new(),
         created_at: now,
     };
+    room.sort_queue();
 
     let response = RoomResponse::from(&room);
     rooms.insert(code, room);
@@ -247,7 +300,6 @@ pub async fn leave_room(
 
     if let Some(room) = rooms.get_mut(&code_upper) {
         room.members.retain(|m| m.id != payload.user_id);
-        // If room is empty, remove it
         if room.members.is_empty() {
             rooms.remove(&code_upper);
         }
@@ -265,4 +317,153 @@ pub async fn delete_room(
     let mut rooms = state.rooms.write().await;
     rooms.remove(&code_upper);
     Ok(Json(serde_json::json!({ "success": true })))
+}
+
+// POST /api/rooms/:code/queue - Add a track to the room queue
+pub async fn add_to_queue(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<AddToQueueRequest>,
+) -> Result<Json<RoomResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let code_upper = code.to_uppercase();
+    let mut rooms = state.rooms.write().await;
+
+    let room = match rooms.get_mut(&code_upper) {
+        Some(r) => r,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Raum nicht gefunden." })),
+            ));
+        }
+    };
+
+    let mut user_id = payload
+        .user_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| "guest".to_string());
+    let mut user_name = payload
+        .user_name
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "Gast".to_string());
+
+    if let Some(token) = extract_session_token(&headers) {
+        let sessions = state.sessions.read().await;
+        if let Some(session) = sessions.get(&token) {
+            user_id = session.user.id.clone();
+            if let Some(ref name) = session.user.display_name {
+                user_name = name.clone();
+            }
+        }
+    }
+
+    // Check if the track is already in the queue
+    if let Some(existing_item) = room.queue.iter_mut().find(|item| item.track_id == payload.track_id) {
+        // Automatically add a vote from this user if not already voted
+        existing_item.voters.insert(user_id);
+        existing_item.votes = existing_item.voters.len();
+    } else {
+        let mut voters = HashSet::new();
+        voters.insert(user_id.clone());
+
+        let new_item = QueueItem {
+            id: uuid::Uuid::new_v4().to_string(),
+            track_id: payload.track_id,
+            name: payload.name,
+            uri: payload.uri,
+            artist_display: payload.artist_display,
+            album_name: payload.album_name,
+            album_art: payload.album_art,
+            duration_ms: payload.duration_ms,
+            added_by_name: user_name,
+            added_by_id: user_id,
+            added_at: current_timestamp(),
+            votes: voters.len(),
+            voters,
+        };
+        room.queue.push(new_item);
+    }
+
+    // Sort queue: highest votes first!
+    room.sort_queue();
+
+    tracing::info!("Track added/voted in queue for room {}", code_upper);
+    Ok(Json(RoomResponse::from(&*room)))
+}
+
+// POST /api/rooms/:code/queue/:track_id/vote - Upvote a track in the queue
+pub async fn vote_track(
+    State(state): State<AppState>,
+    Path((code, track_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(payload): Json<VoteRequest>,
+) -> Result<Json<RoomResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let code_upper = code.to_uppercase();
+    let mut rooms = state.rooms.write().await;
+
+    let room = match rooms.get_mut(&code_upper) {
+        Some(r) => r,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Raum nicht gefunden." })),
+            ));
+        }
+    };
+
+    let mut user_id = payload
+        .user_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| "guest".to_string());
+
+    if let Some(token) = extract_session_token(&headers) {
+        let sessions = state.sessions.read().await;
+        if let Some(session) = sessions.get(&token) {
+            user_id = session.user.id.clone();
+        }
+    }
+
+    let track_found = room.queue.iter_mut().find(|item| item.track_id == track_id);
+    match track_found {
+        Some(item) => {
+            item.voters.insert(user_id);
+            item.votes = item.voters.len();
+        }
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Song nicht in der Queue gefunden." })),
+            ));
+        }
+    }
+
+    // Re-sort queue with new vote count!
+    room.sort_queue();
+
+    Ok(Json(RoomResponse::from(&*room)))
+}
+
+// DELETE /api/rooms/:code/queue/:track_id - Remove a track from queue (e.g. Host)
+pub async fn remove_from_queue(
+    State(state): State<AppState>,
+    Path((code, track_id)): Path<(String, String)>,
+) -> Result<Json<RoomResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let code_upper = code.to_uppercase();
+    let mut rooms = state.rooms.write().await;
+
+    let room = match rooms.get_mut(&code_upper) {
+        Some(r) => r,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Raum nicht gefunden." })),
+            ));
+        }
+    };
+
+    room.queue.retain(|item| item.track_id != track_id);
+    room.sort_queue();
+
+    Ok(Json(RoomResponse::from(&*room)))
 }
