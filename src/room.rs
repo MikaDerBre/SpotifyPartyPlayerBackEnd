@@ -487,3 +487,132 @@ pub async fn remove_from_queue(
 
     Ok(Json(RoomResponse::from(&*room)))
 }
+
+// POST /api/rooms/:code/playback/skip - Skip currently playing track (Host only)
+pub async fn skip_current_track(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let code_upper = code.to_uppercase();
+
+    let host_id = {
+        let rooms = state.rooms.read().await;
+        let room = rooms.get(&code_upper).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Raum nicht gefunden" })),
+            )
+        })?;
+        room.host_id.clone()
+    };
+
+    let token = extract_session_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Nicht authentifiziert" })),
+        )
+    })?;
+
+    {
+        let sessions = state.sessions.read().await;
+        let session = sessions.get(&token).ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Ungültige Sitzung" })),
+            )
+        })?;
+        if session.user.id != host_id {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "Nur der Host darf Songs überspringen" })),
+            ));
+        }
+    }
+
+    let access_token = crate::auth::ensure_host_token(&state, &host_id).await.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Spotify-Authentifizierung des Hosts abgelaufen" })),
+        )
+    })?;
+
+    let (song_to_enqueue, current_track_id) = {
+        let mut rooms = state.rooms.write().await;
+        if let Some(room) = rooms.get_mut(&code_upper) {
+            let cur_tid = room.currently_playing.as_ref().map(|cp| cp.track_id.clone());
+            let already_enqueued = cur_tid.is_some() && room.enqueued_for_track_id == cur_tid;
+
+            if !already_enqueued {
+                room.sort_queue();
+                if !room.queue.is_empty() {
+                    let next = room.queue.remove(0);
+                    (Some(next), cur_tid)
+                } else {
+                    (None, cur_tid)
+                }
+            } else {
+                (None, cur_tid)
+            }
+        } else {
+            (None, None)
+        }
+    };
+
+    if let Some(next_song) = song_to_enqueue {
+        let queue_url = format!(
+            "https://api.spotify.com/v1/me/player/queue?uri={}",
+            crate::auth::urlencoding(&next_song.uri)
+        );
+        let _ = state
+            .http_client
+            .post(&queue_url)
+            .bearer_auth(&access_token)
+            .header("Content-Length", "0")
+            .send()
+            .await;
+
+        if let Some(cur_tid) = current_track_id {
+            let mut rooms = state.rooms.write().await;
+            if let Some(room) = rooms.get_mut(&code_upper) {
+                room.enqueued_for_track_id = Some(cur_tid);
+            }
+        }
+    }
+
+    let skip_res = state
+        .http_client
+        .post("https://api.spotify.com/v1/me/player/next")
+        .bearer_auth(&access_token)
+        .header("Content-Length", "0")
+        .send()
+        .await;
+
+    match skip_res {
+        Ok(res) if res.status().is_success() || res.status() == StatusCode::NO_CONTENT => {
+            tracing::info!("Host successfully skipped track for room {}", code_upper);
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            crate::player_sync::sync_room(&state, &code_upper).await;
+            Ok(Json(serde_json::json!({ "success": true, "message": "Song übersprungen" })))
+        }
+        Ok(res) => {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            tracing::warn!("Spotify skip returned status {}: {}", status, body);
+            Err((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("Spotify konnte nicht überspringen: {}", body)
+                })),
+            ))
+        }
+        Err(e) => {
+            tracing::error!("Network error skipping Spotify track: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Netzwerkfehler beim Überspringen" })),
+            ))
+        }
+    }
+}
+

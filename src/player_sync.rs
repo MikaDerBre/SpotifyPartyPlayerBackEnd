@@ -62,7 +62,7 @@ async fn sync_active_rooms(state: &AppState) {
     }
 }
 
-async fn sync_room(state: &AppState, code: &str) {
+pub async fn sync_room(state: &AppState, code: &str) {
     let host_id = {
         let rooms = state.rooms.read().await;
         match rooms.get(code) {

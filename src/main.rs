@@ -16,7 +16,7 @@ use axum::{
 use config::AppConfig;
 use room::{
     add_to_queue, create_room, delete_room, get_room, join_room, leave_room, remove_from_queue,
-    vote_track,
+    skip_current_track, vote_track,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -106,6 +106,8 @@ async fn main() {
             "/api/rooms/{code}/queue/{track_id}",
             axum::routing::delete(remove_from_queue),
         )
+        // Playback control (Host only)
+        .route("/api/rooms/{code}/playback/skip", post(skip_current_track))
         // Spotify search
         .route("/api/spotify/search", get(spotify::search_tracks))
         .fallback_service(serve_dir)
