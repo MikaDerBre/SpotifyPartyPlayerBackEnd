@@ -75,6 +75,7 @@ async fn main() {
         .route("/api/auth/spotify/login", get(spotify_login_redirect))
         .route("/api/auth/spotify/url", get(spotify_login_url))
         .route("/api/auth/spotify/callback", get(spotify_callback))
+        .route("/auth/callback", get(spotify_callback))
         .route("/api/auth/me", get(get_current_user))
         .route("/api/auth/logout", post(logout))
         .layer(cors)

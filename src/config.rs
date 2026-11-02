@@ -14,7 +14,7 @@ impl AppConfig {
         let spotify_client_id = env::var("SPOTIFY_CLIENT_ID").unwrap_or_default();
         let spotify_client_secret = env::var("SPOTIFY_CLIENT_SECRET").unwrap_or_default();
         let spotify_redirect_uri = env::var("SPOTIFY_REDIRECT_URI")
-            .unwrap_or_else(|_| "http://127.0.0.1:3000/api/auth/spotify/callback".to_string());
+            .unwrap_or_else(|_| "http://127.0.0.1:3000/auth/callback".to_string());
         let frontend_url = env::var("FRONTEND_URL")
             .unwrap_or_else(|_| "http://localhost:9000".to_string());
         let port = env::var("PORT")
