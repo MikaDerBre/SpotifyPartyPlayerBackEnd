@@ -99,6 +99,7 @@ dependencies = [
  "axum",
  "base64",
  "dotenvy",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

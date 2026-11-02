@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod room;
 
 use auth::{
     get_auth_status, get_current_user, logout, spotify_callback, spotify_login_redirect,
@@ -11,6 +12,7 @@ use axum::{
     Json, Router,
 };
 use config::AppConfig;
+use room::{create_room, delete_room, get_room, join_room, leave_room};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -61,6 +63,7 @@ async fn main() {
         http_client: reqwest::Client::new(),
         sessions: Arc::new(RwLock::new(HashMap::new())),
         oauth_states: Arc::new(RwLock::new(HashMap::new())),
+        rooms: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let cors = CorsLayer::new()
@@ -71,6 +74,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(root))
         .route("/api/health", get(health_check))
+        // Auth routes
         .route("/api/auth/status", get(get_auth_status))
         .route("/api/auth/spotify/login", get(spotify_login_redirect))
         .route("/api/auth/spotify/url", get(spotify_login_url))
@@ -78,6 +82,11 @@ async fn main() {
         .route("/auth/callback", get(spotify_callback))
         .route("/api/auth/me", get(get_current_user))
         .route("/api/auth/logout", post(logout))
+        // Room routes
+        .route("/api/rooms", post(create_room))
+        .route("/api/rooms/{code}", get(get_room).delete(delete_room))
+        .route("/api/rooms/{code}/join", post(join_room))
+        .route("/api/rooms/{code}/leave", post(leave_room))
         .layer(cors)
         .with_state(state);
 

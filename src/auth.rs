@@ -17,12 +17,15 @@ use crate::config::AppConfig;
 
 const SPOTIFY_SCOPES: &str = "user-read-private user-read-email user-read-playback-state user-modify-playback-state user-read-currently-playing streaming playlist-read-private playlist-modify-public playlist-modify-private";
 
+use crate::room::Room;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
     pub http_client: reqwest::Client,
     pub sessions: Arc<RwLock<HashMap<String, UserSession>>>,
     pub oauth_states: Arc<RwLock<HashMap<String, Instant>>>,
+    pub rooms: Arc<RwLock<HashMap<String, Room>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -264,7 +267,7 @@ pub async fn spotify_callback(
     Ok(Redirect::temporary(&redirect_url))
 }
 
-fn extract_session_token(headers: &HeaderMap) -> Option<String> {
+pub fn extract_session_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth_val) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
         if let Some(token) = auth_val.strip_prefix("Bearer ") {
             return Some(token.trim().to_string());
