@@ -24,6 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Serialize)]
@@ -33,9 +34,6 @@ struct HealthResponse {
     spotify_configured: bool,
 }
 
-async fn root() -> &'static str {
-    "Spotify Party Player API Server"
-}
 
 async fn health_check(axum::extract::State(state): axum::extract::State<AppState>) -> impl IntoResponse {
     Json(HealthResponse {
@@ -79,8 +77,11 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let static_dir = "static";
+    let serve_dir = ServeDir::new(static_dir)
+        .not_found_service(ServeFile::new(format!("{}/index.html", static_dir)));
+
     let app = Router::new()
-        .route("/", get(root))
         .route("/api/health", get(health_check))
         // Auth routes
         .route("/api/auth/status", get(get_auth_status))
@@ -107,6 +108,7 @@ async fn main() {
         )
         // Spotify search
         .route("/api/spotify/search", get(spotify::search_tracks))
+        .fallback_service(serve_dir)
         .layer(cors)
         .with_state(state);
 
