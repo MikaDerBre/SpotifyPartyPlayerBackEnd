@@ -19,19 +19,12 @@ const SPOTIFY_SCOPES: &str = "user-read-private user-read-email user-read-playba
 
 use crate::room::Room;
 
-#[derive(Clone, Debug)]
-pub struct OAuthStateData {
-    pub created_at: Instant,
-    pub redirect_uri: String,
-    pub frontend_url: String,
-}
-
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
     pub http_client: reqwest::Client,
     pub sessions: Arc<RwLock<HashMap<String, UserSession>>>,
-    pub oauth_states: Arc<RwLock<HashMap<String, OAuthStateData>>>,
+    pub oauth_states: Arc<RwLock<HashMap<String, Instant>>>,
     pub rooms: Arc<RwLock<HashMap<String, Room>>>,
 }
 
@@ -86,60 +79,20 @@ pub struct AuthStatusResponse {
     pub user: Option<SpotifyUserProfile>,
 }
 
-pub async fn get_auth_url(app_state: &AppState, headers: Option<&HeaderMap>) -> (String, String) {
+pub async fn get_auth_url(app_state: &AppState) -> (String, String) {
     let state = Uuid::new_v4().to_string();
-
-    let mut redirect_uri = app_state.config.spotify_redirect_uri.clone();
-    let mut frontend_url = app_state.config.frontend_url.clone();
-
-    if let Some(hdrs) = headers {
-        if let Some(host_val) = hdrs.get("host").and_then(|h| h.to_str().ok()) {
-            let host_part = host_val.split(':').next().unwrap_or(host_val);
-            if !host_part.is_empty()
-                && host_part != "localhost"
-                && host_part != "127.0.0.1"
-                && host_part != "0.0.0.0"
-            {
-                // External/LAN host (e.g. 192.168.178.61:3000)
-                let port = host_val.split(':').nth(1).unwrap_or("3000");
-                redirect_uri = format!("http://{}:{}/auth/callback", host_part, port);
-
-                if let Some(referer) = hdrs.get("referer").and_then(|r| r.to_str().ok()) {
-                    if let Ok(parsed_ref) = url::Url::parse(referer) {
-                        if let Some(h) = parsed_ref.host_str() {
-                            let p = parsed_ref
-                                .port()
-                                .map(|port| format!(":{}", port))
-                                .unwrap_or_default();
-                            frontend_url = format!("{}://{}{}", parsed_ref.scheme(), h, p);
-                        }
-                    }
-                } else {
-                    frontend_url = format!("http://{}:9000", host_part);
-                }
-            }
-        }
-    }
-
     {
         let mut states = app_state.oauth_states.write().await;
         // Clean up states older than 10 minutes
-        states.retain(|_, data| data.created_at.elapsed() < Duration::from_secs(600));
-        states.insert(
-            state.clone(),
-            OAuthStateData {
-                created_at: Instant::now(),
-                redirect_uri: redirect_uri.clone(),
-                frontend_url,
-            },
-        );
+        states.retain(|_, time| time.elapsed() < Duration::from_secs(600));
+        states.insert(state.clone(), Instant::now());
     }
 
     let auth_url = format!(
         "https://accounts.spotify.com/authorize?response_type=code&client_id={}&scope={}&redirect_uri={}&state={}",
         urlencoding(&app_state.config.spotify_client_id),
         urlencoding(SPOTIFY_SCOPES),
-        urlencoding(&redirect_uri),
+        urlencoding(&app_state.config.spotify_redirect_uri),
         urlencoding(&state),
     );
 
@@ -150,10 +103,7 @@ pub fn urlencoding(input: &str) -> String {
     url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
 }
 
-pub async fn spotify_login_url(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+pub async fn spotify_login_url(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     if !state.config.is_spotify_configured() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -163,14 +113,11 @@ pub async fn spotify_login_url(
         ));
     }
 
-    let (_, auth_url) = get_auth_url(&state, Some(&headers)).await;
+    let (_, auth_url) = get_auth_url(&state).await;
     Ok(Json(serde_json::json!({ "url": auth_url })))
 }
 
-pub async fn spotify_login_redirect(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Redirect, (StatusCode, String)> {
+pub async fn spotify_login_redirect(State(state): State<AppState>) -> Result<Redirect, (StatusCode, String)> {
     if !state.config.is_spotify_configured() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -178,7 +125,7 @@ pub async fn spotify_login_redirect(
         ));
     }
 
-    let (_, auth_url) = get_auth_url(&state, Some(&headers)).await;
+    let (_, auth_url) = get_auth_url(&state).await;
     Ok(Redirect::temporary(&auth_url))
 }
 
@@ -186,18 +133,18 @@ pub async fn spotify_callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackQuery>,
 ) -> Result<Redirect, (StatusCode, String)> {
-    let default_frontend_url = state.config.frontend_url.clone();
+    let frontend_url = state.config.frontend_url.clone();
 
     if let Some(err) = params.error {
         tracing::warn!("Spotify auth error: {}", err);
-        let redirect_url = format!("{}/#/callback?error={}", default_frontend_url, urlencoding(&err));
+        let redirect_url = format!("{}/#/callback?error={}", frontend_url, urlencoding(&err));
         return Ok(Redirect::temporary(&redirect_url));
     }
 
     let code = match params.code {
         Some(c) => c,
         None => {
-            let redirect_url = format!("{}/#/callback?error=missing_code", default_frontend_url);
+            let redirect_url = format!("{}/#/callback?error=missing_code", frontend_url);
             return Ok(Redirect::temporary(&redirect_url));
         }
     };
@@ -205,25 +152,20 @@ pub async fn spotify_callback(
     let oauth_state = match params.state {
         Some(s) => s,
         None => {
-            let redirect_url = format!("{}/#/callback?error=missing_state", default_frontend_url);
+            let redirect_url = format!("{}/#/callback?error=missing_state", frontend_url);
             return Ok(Redirect::temporary(&redirect_url));
         }
     };
 
-    // Verify state and extract stored redirect_uri and frontend_url
-    let (stored_redirect_uri, frontend_url) = {
+    // Verify state
+    {
         let mut states = state.oauth_states.write().await;
-        match states.remove(&oauth_state) {
-            Some(data) if data.created_at.elapsed() < Duration::from_secs(600) => {
-                (data.redirect_uri, data.frontend_url)
-            }
-            _ => {
-                tracing::warn!("Invalid or expired OAuth state: {}", oauth_state);
-                let redirect_url = format!("{}/#/callback?error=invalid_state", default_frontend_url);
-                return Ok(Redirect::temporary(&redirect_url));
-            }
+        if states.remove(&oauth_state).is_none() {
+            tracing::warn!("Invalid or expired OAuth state: {}", oauth_state);
+            let redirect_url = format!("{}/#/callback?error=invalid_state", frontend_url);
+            return Ok(Redirect::temporary(&redirect_url));
         }
-    };
+    }
 
     // Exchange authorization code for access token
     let credentials = format!(
@@ -235,7 +177,7 @@ pub async fn spotify_callback(
     let form_params = [
         ("grant_type", "authorization_code"),
         ("code", &code),
-        ("redirect_uri", &stored_redirect_uri),
+        ("redirect_uri", &state.config.spotify_redirect_uri),
     ];
 
     let token_res = state
