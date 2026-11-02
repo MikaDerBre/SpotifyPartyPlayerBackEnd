@@ -99,7 +99,7 @@ pub async fn get_auth_url(app_state: &AppState) -> (String, String) {
     (state, auth_url)
 }
 
-fn urlencoding(input: &str) -> String {
+pub fn urlencoding(input: &str) -> String {
     url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
 }
 
@@ -331,4 +331,55 @@ pub async fn logout(
     }
 
     Ok(Json(serde_json::json!({ "success": true })))
+}
+
+pub async fn ensure_host_token(state: &AppState, host_id: &str) -> Option<String> {
+    let (mut session_to_refresh, session_key) = {
+        let sessions = state.sessions.read().await;
+        let found = sessions.iter().find(|(_, s)| s.user.id == host_id)?;
+        if found.1.expires_at > Instant::now() + Duration::from_secs(60) {
+            return Some(found.1.access_token.clone());
+        }
+        (found.1.clone(), found.0.clone())
+    };
+
+    let refresh_token = session_to_refresh.refresh_token.as_ref()?;
+    let credentials = format!(
+        "{}:{}",
+        state.config.spotify_client_id, state.config.spotify_client_secret
+    );
+    let basic_auth = format!("Basic {}", BASE64.encode(credentials.as_bytes()));
+
+    let form_params = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+
+    let res = state
+        .http_client
+        .post("https://accounts.spotify.com/api/token")
+        .header("Authorization", basic_auth)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(&form_params)
+        .send()
+        .await
+        .ok()?;
+
+    if res.status().is_success() {
+        if let Ok(data) = res.json::<SpotifyTokenResponse>().await {
+            let new_access_token = data.access_token.clone();
+            session_to_refresh.access_token = data.access_token;
+            if let Some(new_rt) = data.refresh_token {
+                session_to_refresh.refresh_token = Some(new_rt);
+            }
+            session_to_refresh.expires_at =
+                Instant::now() + Duration::from_secs(data.expires_in.saturating_sub(60));
+
+            let mut sessions = state.sessions.write().await;
+            sessions.insert(session_key, session_to_refresh);
+            return Some(new_access_token);
+        }
+    }
+
+    Some(session_to_refresh.access_token)
 }

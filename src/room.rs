@@ -37,6 +37,20 @@ pub struct QueueItem {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CurrentlyPlayingInfo {
+    pub track_id: String,
+    pub name: String,
+    pub uri: String,
+    pub artist_display: String,
+    pub album_name: String,
+    pub album_art: Option<String>,
+    pub duration_ms: u64,
+    pub progress_ms: u64,
+    pub is_playing: bool,
+    pub remaining_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Room {
     pub code: String,
     pub name: String,
@@ -45,6 +59,8 @@ pub struct Room {
     pub members: Vec<RoomMember>,
     pub queue: Vec<QueueItem>,
     pub created_at: u64,
+    pub currently_playing: Option<CurrentlyPlayingInfo>,
+    pub enqueued_for_track_id: Option<String>,
 }
 
 impl Room {
@@ -104,6 +120,7 @@ pub struct RoomResponse {
     pub member_count: usize,
     pub queue: Vec<QueueItem>,
     pub created_at: u64,
+    pub currently_playing: Option<CurrentlyPlayingInfo>,
 }
 
 impl From<&Room> for RoomResponse {
@@ -117,6 +134,7 @@ impl From<&Room> for RoomResponse {
             member_count: r.members.len(),
             queue: r.queue.clone(),
             created_at: r.created_at,
+            currently_playing: r.currently_playing.clone(),
         }
     }
 }
@@ -195,6 +213,8 @@ pub async fn create_room(
         members: vec![host_member],
         queue: Vec::new(),
         created_at: now,
+        currently_playing: None,
+        enqueued_for_track_id: None,
     };
     room.sort_queue();
 

@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod player_sync;
 mod room;
 mod spotify;
 
@@ -69,6 +70,9 @@ async fn main() {
         oauth_states: Arc::new(RwLock::new(HashMap::new())),
         rooms: Arc::new(RwLock::new(HashMap::new())),
     };
+
+    // Start background worker for player status sync & auto-enqueue transition
+    player_sync::start_sync_loop(state.clone());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
