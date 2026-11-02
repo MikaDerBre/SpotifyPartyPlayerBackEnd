@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod room;
+mod spotify;
 
 use auth::{
     get_auth_status, get_current_user, logout, spotify_callback, spotify_login_redirect,
@@ -87,6 +88,8 @@ async fn main() {
         .route("/api/rooms/{code}", get(get_room).delete(delete_room))
         .route("/api/rooms/{code}/join", post(join_room))
         .route("/api/rooms/{code}/leave", post(leave_room))
+        // Spotify search
+        .route("/api/spotify/search", get(spotify::search_tracks))
         .layer(cors)
         .with_state(state);
 
