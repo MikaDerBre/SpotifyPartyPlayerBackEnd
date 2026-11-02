@@ -121,6 +121,10 @@ async fn get_access_token_for_search(
     }
 
     // 4. Fallback to Client Credentials flow (App Token)
+    get_client_credentials_token(state).await
+}
+
+async fn get_client_credentials_token(state: &AppState) -> Result<String, (StatusCode, String)> {
     if !state.config.is_spotify_configured() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -182,7 +186,7 @@ pub async fn search_tracks(
     .await
     .map_err(|(status, msg)| (status, Json(serde_json::json!({ "error": msg }))))?;
 
-    let limit = params.limit.unwrap_or(20).clamp(1, 50);
+    let limit = params.limit.unwrap_or(10).clamp(1, 10);
 
     let search_url = format!(
         "https://api.spotify.com/v1/search?q={}&type=track&limit={}",
@@ -190,7 +194,7 @@ pub async fn search_tracks(
         limit
     );
 
-    let spotify_res = state
+    let mut spotify_res = state
         .http_client
         .get(&search_url)
         .bearer_auth(&access_token)
@@ -202,6 +206,18 @@ pub async fn search_tracks(
                 Json(serde_json::json!({ "error": format!("Spotify API error: {}", e) })),
             )
         })?;
+
+    // If first attempt failed (e.g. dev mode token restriction), retry with client credentials
+    if !spotify_res.status().is_success() {
+        tracing::warn!("Spotify search with initial token failed ({}), attempting client credentials fallback...", spotify_res.status());
+        if let Ok(cc_token) = get_client_credentials_token(&state).await {
+            if let Ok(retry_res) = state.http_client.get(&search_url).bearer_auth(&cc_token).send().await {
+                if retry_res.status().is_success() {
+                    spotify_res = retry_res;
+                }
+            }
+        }
+    }
 
     if !spotify_res.status().is_success() {
         let status = spotify_res.status();
