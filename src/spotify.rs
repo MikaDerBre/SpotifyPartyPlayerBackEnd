@@ -178,13 +178,36 @@ pub async fn search_tracks(
         }));
     }
 
-    let access_token = get_access_token_for_search(
+    let is_demo_room = if let Some(ref code) = params.room_code {
+        let rooms = state.rooms.read().await;
+        rooms.get(&code.to_uppercase()).map_or(false, |r| r.is_demo)
+    } else {
+        false
+    };
+
+    if is_demo_room {
+        let tracks = search_demo_tracks(query_str);
+        return Ok(Json(SearchResponse {
+            query: query_str.to_string(),
+            tracks,
+        }));
+    }
+
+    let access_token = match get_access_token_for_search(
         &state,
         &headers,
         params.room_code.as_deref(),
     )
-    .await
-    .map_err(|(status, msg)| (status, Json(serde_json::json!({ "error": msg }))))?;
+    .await {
+        Ok(t) => t,
+        Err(_) => {
+            tracing::info!("Using demo tracks fallback for search '{}' (no active Spotify token)", query_str);
+            return Ok(Json(SearchResponse {
+                query: query_str.to_string(),
+                tracks: search_demo_tracks(query_str),
+            }));
+        }
+    };
 
     let limit = params.limit.unwrap_or(10).clamp(1, 10);
 
@@ -194,20 +217,22 @@ pub async fn search_tracks(
         limit
     );
 
-    let mut spotify_res = state
+    let mut spotify_res = match state
         .http_client
         .get(&search_url)
         .bearer_auth(&access_token)
         .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": format!("Spotify API error: {}", e) })),
-            )
-        })?;
+        .await {
+            Ok(r) => r,
+            Err(_) => {
+                return Ok(Json(SearchResponse {
+                    query: query_str.to_string(),
+                    tracks: search_demo_tracks(query_str),
+                }));
+            }
+        };
 
-    // If first attempt failed (e.g. dev mode token restriction), retry with client credentials
+    // If first attempt failed (e.g. dev mode token restriction or rate limit), retry with client credentials or fallback
     if !spotify_res.status().is_success() {
         tracing::warn!("Spotify search with initial token failed ({}), attempting client credentials fallback...", spotify_res.status());
         if let Ok(cc_token) = get_client_credentials_token(&state).await {
@@ -220,21 +245,22 @@ pub async fn search_tracks(
     }
 
     if !spotify_res.status().is_success() {
-        let status = spotify_res.status();
-        let body = spotify_res.text().await.unwrap_or_default();
-        tracing::error!("Spotify search error ({}): {}", status, body);
-        return Err((
-            status,
-            Json(serde_json::json!({ "error": "Spotify Suche fehlgeschlagen", "details": body })),
-        ));
+        tracing::info!("Spotify API search returned error ({}), gracefully returning demo tracks...", spotify_res.status());
+        return Ok(Json(SearchResponse {
+            query: query_str.to_string(),
+            tracks: search_demo_tracks(query_str),
+        }));
     }
 
-    let raw: SpotifyRawSearchResponse = spotify_res.json().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Failed to parse tracks: {}", e) })),
-        )
-    })?;
+    let raw: SpotifyRawSearchResponse = match spotify_res.json().await {
+        Ok(r) => r,
+        Err(_) => {
+            return Ok(Json(SearchResponse {
+                query: query_str.to_string(),
+                tracks: search_demo_tracks(query_str),
+            }));
+        }
+    };
 
     let tracks = raw
         .tracks
@@ -269,4 +295,183 @@ pub async fn search_tracks(
         query: query_str.to_string(),
         tracks,
     }))
+}
+
+pub fn get_demo_tracks() -> Vec<TrackItem> {
+    vec![
+        TrackItem {
+            id: "demo_1".into(),
+            name: "Blinding Lights".into(),
+            uri: "spotify:track:0VjIjW4GlUZAMYd2vXMi3b".into(),
+            artists: vec!["The Weeknd".into()],
+            artist_display: "The Weeknd".into(),
+            album_name: "After Hours".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b2738863bc11d2aa12b54f5aeb36".into()),
+            duration_ms: 200000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_2".into(),
+            name: "Levitating".into(),
+            uri: "spotify:track:463CkQjx2Zk1yXoBuierM9".into(),
+            artists: vec!["Dua Lipa".into()],
+            artist_display: "Dua Lipa".into(),
+            album_name: "Future Nostalgia".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b273bd26ede1ae69327010d49946".into()),
+            duration_ms: 203000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_3".into(),
+            name: "One More Time".into(),
+            uri: "spotify:track:0DiWol3AO6WpXZgp0gGlNW".into(),
+            artists: vec!["Daft Punk".into()],
+            artist_display: "Daft Punk".into(),
+            album_name: "Discovery".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b27364658d30e5270c538cb3c0fa".into()),
+            duration_ms: 320000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_4".into(),
+            name: "As It Was".into(),
+            uri: "spotify:track:4LRPiXqCikLlN15c3yImP7".into(),
+            artists: vec!["Harry Styles".into()],
+            artist_display: "Harry Styles".into(),
+            album_name: "Harry's House".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b2732e8ed79e177ff6011076f5f0".into()),
+            duration_ms: 167000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_5".into(),
+            name: "Levels".into(),
+            uri: "spotify:track:5UqCQaD9rIk42iEvP5Utbv".into(),
+            artists: vec!["Avicii".into()],
+            artist_display: "Avicii".into(),
+            album_name: "Levels".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b2736b7617b0d778d975ab4fb27d".into()),
+            duration_ms: 200000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_6".into(),
+            name: "Don't Stop Me Now".into(),
+            uri: "spotify:track:5T8KuEkjh26IDQg7G8q0zZ".into(),
+            artists: vec!["Queen".into()],
+            artist_display: "Queen".into(),
+            album_name: "Jazz".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b2737c3905cf714fb296ad50eb55".into()),
+            duration_ms: 209000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_7".into(),
+            name: "September".into(),
+            uri: "spotify:track:2grjqo0Frpf25SaISBkuOJ".into(),
+            artists: vec!["Earth, Wind & Fire".into()],
+            artist_display: "Earth, Wind & Fire".into(),
+            album_name: "The Best of Earth, Wind & Fire".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b273e3bfda3733a8a3a2d3989c44".into()),
+            duration_ms: 215000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_8".into(),
+            name: "Can't Hold Us".into(),
+            uri: "spotify:track:3bidbhpOiOYv1Y5HNDRJ7n".into(),
+            artists: vec!["Macklemore & Ryan Lewis".into(), "Ray Dalton".into()],
+            artist_display: "Macklemore & Ryan Lewis, Ray Dalton".into(),
+            album_name: "The Heist".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b27329971bc32204c352ee8a209b".into()),
+            duration_ms: 258000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_9".into(),
+            name: "Gimme! Gimme! Gimme!".into(),
+            uri: "spotify:track:3vkQ5DAB1qQMYO4Mr9zJN2".into(),
+            artists: vec!["ABBA".into()],
+            artist_display: "ABBA".into(),
+            album_name: "Voulez-Vous".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b2737c3583ca86e0daeaab579477".into()),
+            duration_ms: 288000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_10".into(),
+            name: "Titanium (feat. Sia)".into(),
+            uri: "spotify:track:0TDLuuLlV54CkRRUOahJb4".into(),
+            artists: vec!["David Guetta".into(), "Sia".into()],
+            artist_display: "David Guetta, Sia".into(),
+            album_name: "Nothing but the Beat".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b273981fc47c40d7c71d9d7ec430".into()),
+            duration_ms: 245000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_11".into(),
+            name: "Flowers".into(),
+            uri: "spotify:track:0yLdt7AgGvymDIAvpsPLFd".into(),
+            artists: vec!["Miley Cyrus".into()],
+            artist_display: "Miley Cyrus".into(),
+            album_name: "Endless Summer Vacation".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b273f429549123dbe8552764ba1d".into()),
+            duration_ms: 200000,
+            explicit: false,
+        },
+        TrackItem {
+            id: "demo_12".into(),
+            name: "24K Magic".into(),
+            uri: "spotify:track:6b8Be6gHG9EILpHNv7AqNe".into(),
+            artists: vec!["Bruno Mars".into()],
+            artist_display: "Bruno Mars".into(),
+            album_name: "24K Magic".into(),
+            album_art: Some("https://i.scdn.co/image/ab67616d0000b273ef4d402e3b2e5668b5930e1a".into()),
+            duration_ms: 225000,
+            explicit: false,
+        },
+    ]
+}
+
+pub fn search_demo_tracks(query: &str) -> Vec<TrackItem> {
+    let q = query.trim().to_lowercase();
+    let all = get_demo_tracks();
+    if q.is_empty() {
+        return all;
+    }
+
+    let filtered: Vec<TrackItem> = all
+        .iter()
+        .filter(|t| {
+            t.name.to_lowercase().contains(&q)
+                || t.artist_display.to_lowercase().contains(&q)
+                || t.album_name.to_lowercase().contains(&q)
+        })
+        .cloned()
+        .collect();
+
+    if !filtered.is_empty() {
+        filtered
+    } else {
+        // Fallback: return popular songs if query has no direct match
+        all.into_iter().take(6).collect()
+    }
+}
+
+pub fn get_default_demo_track(idx: usize) -> crate::room::CurrentlyPlayingInfo {
+    let demos = get_demo_tracks();
+    let track = &demos[idx % demos.len()];
+    crate::room::CurrentlyPlayingInfo {
+        track_id: track.id.clone(),
+        name: track.name.clone(),
+        uri: track.uri.clone(),
+        artist_display: track.artist_display.clone(),
+        album_name: track.album_name.clone(),
+        album_art: track.album_art.clone(),
+        duration_ms: track.duration_ms,
+        progress_ms: 0,
+        is_playing: true,
+        remaining_ms: track.duration_ms,
+    }
 }

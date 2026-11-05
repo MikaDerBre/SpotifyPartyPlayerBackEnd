@@ -61,6 +61,12 @@ pub struct Room {
     pub created_at: u64,
     pub currently_playing: Option<CurrentlyPlayingInfo>,
     pub enqueued_for_track_id: Option<String>,
+    #[serde(default)]
+    pub is_demo: bool,
+    #[serde(skip)]
+    pub last_polled_at: Option<std::time::Instant>,
+    #[serde(skip)]
+    pub last_activity_at: Option<std::time::Instant>,
 }
 
 impl Room {
@@ -79,6 +85,8 @@ impl Room {
 pub struct CreateRoomRequest {
     pub name: String,
     pub host_name: Option<String>,
+    #[serde(default)]
+    pub is_demo: bool,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +129,7 @@ pub struct RoomResponse {
     pub queue: Vec<QueueItem>,
     pub created_at: u64,
     pub currently_playing: Option<CurrentlyPlayingInfo>,
+    pub is_demo: bool,
 }
 
 impl From<&Room> for RoomResponse {
@@ -135,6 +144,7 @@ impl From<&Room> for RoomResponse {
             queue: r.queue.clone(),
             created_at: r.created_at,
             currently_playing: r.currently_playing.clone(),
+            is_demo: r.is_demo,
         }
     }
 }
@@ -163,26 +173,42 @@ pub async fn create_room(
     headers: HeaderMap,
     Json(payload): Json<CreateRoomRequest>,
 ) -> Result<Json<RoomResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let mut host_id = uuid::Uuid::new_v4().to_string();
-    let mut host_name = payload
-        .host_name
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(|| "Host".to_string());
-    let mut avatar_url = None;
-
-    // Check if the user is authenticated with Spotify
-    if let Some(token) = extract_session_token(&headers) {
+    // Check if the user is authenticated with Spotify (or creating a demo room)
+    let (host_id, host_name, avatar_url) = if payload.is_demo {
+        let hname = payload
+            .host_name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "Demo DJ".to_string());
+        (
+            "demo_host".to_string(),
+            hname,
+            Some("https://i.scdn.co/image/ab67616d0000b2738863bc11d2aa12b54f5aeb36".to_string()),
+        )
+    } else if let Some(token) = extract_session_token(&headers) {
         let sessions = state.sessions.read().await;
         if let Some(session) = sessions.get(&token) {
-            host_id = session.user.id.clone();
-            if let Some(ref name) = session.user.display_name {
-                host_name = name.clone();
-            }
-            if let Some(img) = session.user.images.first() {
-                avatar_url = Some(img.url.clone());
-            }
+            let hid = session.user.id.clone();
+            let hname = session.user.display_name.clone().unwrap_or_else(|| {
+                payload.host_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Host".to_string())
+            });
+            let av = session.user.images.first().map(|img| img.url.clone());
+            (hid, hname, av)
+        } else {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Deine Spotify-Sitzung ist abgelaufen oder ungültig. Bitte melde dich erneut mit Spotify an."
+                })),
+            ));
         }
-    }
+    } else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Nur mit Spotify angemeldete Nutzer können einen Party-Raum erstellen (oder nutze den Demo-Modus)."
+            })),
+        ));
+    };
 
     let mut rooms = state.rooms.write().await;
 
@@ -201,10 +227,20 @@ pub async fn create_room(
         joined_at: now,
     };
 
+    let initial_cp = if payload.is_demo {
+        Some(crate::spotify::get_default_demo_track(0))
+    } else {
+        None
+    };
+
     let mut room = Room {
         code: code.clone(),
         name: if payload.name.trim().is_empty() {
-            format!("{}'s Party", host_name)
+            if payload.is_demo {
+                "Showcase Demo Party".to_string()
+            } else {
+                format!("{}'s Party", host_name)
+            }
         } else {
             payload.name.trim().to_string()
         },
@@ -213,8 +249,11 @@ pub async fn create_room(
         members: vec![host_member],
         queue: Vec::new(),
         created_at: now,
-        currently_playing: None,
+        currently_playing: initial_cp,
         enqueued_for_track_id: None,
+        is_demo: payload.is_demo,
+        last_polled_at: None,
+        last_activity_at: Some(std::time::Instant::now()),
     };
     room.sort_queue();
 
@@ -231,10 +270,13 @@ pub async fn get_room(
     Path(code): Path<String>,
 ) -> Result<Json<RoomResponse>, (StatusCode, Json<serde_json::Value>)> {
     let code_upper = code.to_uppercase();
-    let rooms = state.rooms.read().await;
+    let mut rooms = state.rooms.write().await;
 
-    match rooms.get(&code_upper) {
-        Some(room) => Ok(Json(RoomResponse::from(room))),
+    match rooms.get_mut(&code_upper) {
+        Some(room) => {
+            room.last_activity_at = Some(std::time::Instant::now());
+            Ok(Json(RoomResponse::from(&*room)))
+        }
         None => Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Raum nicht gefunden. Bitte prüfe den Code." })),
@@ -496,7 +538,7 @@ pub async fn skip_current_track(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let code_upper = code.to_uppercase();
 
-    let host_id = {
+    let (host_id, is_demo) = {
         let rooms = state.rooms.read().await;
         let room = rooms.get(&code_upper).ok_or_else(|| {
             (
@@ -504,8 +546,43 @@ pub async fn skip_current_track(
                 Json(serde_json::json!({ "error": "Raum nicht gefunden" })),
             )
         })?;
-        room.host_id.clone()
+        (room.host_id.clone(), room.is_demo)
     };
+
+    // In demo rooms, skip immediately advances the simulated player to the #1 voted queue song!
+    if is_demo {
+        let mut rooms = state.rooms.write().await;
+        if let Some(room) = rooms.get_mut(&code_upper) {
+            room.sort_queue();
+            let next_cp = if !room.queue.is_empty() {
+                let next = room.queue.remove(0);
+                CurrentlyPlayingInfo {
+                    track_id: next.track_id,
+                    name: next.name,
+                    uri: next.uri,
+                    artist_display: next.artist_display,
+                    album_name: next.album_name,
+                    album_art: next.album_art,
+                    duration_ms: next.duration_ms,
+                    progress_ms: 0,
+                    is_playing: true,
+                    remaining_ms: next.duration_ms,
+                }
+            } else {
+                let all_demos = crate::spotify::get_demo_tracks();
+                let cur_id = room.currently_playing.as_ref().map(|c| c.track_id.as_str()).unwrap_or("");
+                let next_idx = all_demos
+                    .iter()
+                    .position(|t| t.id == cur_id)
+                    .map(|i| (i + 1) % all_demos.len())
+                    .unwrap_or(0);
+                crate::spotify::get_default_demo_track(next_idx)
+            };
+            room.currently_playing = Some(next_cp);
+            room.last_polled_at = Some(std::time::Instant::now());
+        }
+        return Ok(Json(serde_json::json!({ "success": true, "message": "Demo-Song übersprungen" })));
+    }
 
     let token = extract_session_token(&headers).ok_or_else(|| {
         (
@@ -615,4 +692,164 @@ pub async fn skip_current_track(
         }
     }
 }
+
+// POST /api/rooms/:code/link-host - Link current authenticated Spotify user as host of this room
+pub async fn link_host(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<RoomResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let code_upper = code.to_uppercase();
+
+    let token = extract_session_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Nicht mit Spotify angemeldet" })),
+        )
+    })?;
+
+    let session_user = {
+        let sessions = state.sessions.read().await;
+        let session = sessions.get(&token).ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Ungültige oder abgelaufene Spotify-Sitzung" })),
+            )
+        })?;
+        session.user.clone()
+    };
+
+    {
+        let mut rooms = state.rooms.write().await;
+        let room = rooms.get_mut(&code_upper).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Raum nicht gefunden" })),
+            )
+        })?;
+
+        tracing::info!(
+            "Linking Spotify host '{}' ({}) to room {}",
+            session_user.display_name.as_deref().unwrap_or(&session_user.id),
+            session_user.id,
+            code_upper
+        );
+
+        room.host_id = session_user.id.clone();
+        if let Some(ref name) = session_user.display_name {
+            room.host_name = name.clone();
+        }
+
+        // Update or add host in members list
+        let mut found_member = false;
+        for member in &mut room.members {
+            if member.is_host {
+                member.id = session_user.id.clone();
+                member.name = room.host_name.clone();
+                if let Some(img) = session_user.images.first() {
+                    member.avatar_url = Some(img.url.clone());
+                }
+                found_member = true;
+                break;
+            }
+        }
+        if !found_member {
+            room.members.push(RoomMember {
+                id: session_user.id.clone(),
+                name: room.host_name.clone(),
+                is_host: true,
+                avatar_url: session_user.images.first().map(|img| img.url.clone()),
+                joined_at: current_timestamp(),
+            });
+        }
+    }
+
+    // Immediately trigger a sync for this room
+    crate::player_sync::sync_room(&state, &code_upper).await;
+
+    let rooms = state.rooms.read().await;
+    let room = rooms.get(&code_upper).unwrap();
+    Ok(Json(RoomResponse::from(room)))
+}
+
+// GET /api/rooms/:code/player-diagnostics - Diagnostic check for Spotify playback
+pub async fn get_player_diagnostics(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let code_upper = code.to_uppercase();
+    let host_id = {
+        let rooms = state.rooms.read().await;
+        let room = rooms.get(&code_upper).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Raum nicht gefunden" })),
+            )
+        })?;
+        room.host_id.clone()
+    };
+
+    let has_session = {
+        let sessions = state.sessions.read().await;
+        sessions.values().any(|s| s.user.id == host_id)
+    };
+
+    let token_opt = crate::auth::ensure_host_token(&state, &host_id).await;
+    let has_token = token_opt.is_some();
+
+    let mut spotify_status = None;
+    let mut spotify_body = None;
+    let mut retry_after_sec = None;
+
+    if let Some(ref access_token) = token_opt {
+        if let Ok(res) = state
+            .http_client
+            .get("https://api.spotify.com/v1/me/player/currently-playing?additional_types=track,episode")
+            .bearer_auth(access_token)
+            .send()
+            .await
+        {
+            spotify_status = Some(res.status().as_u16());
+            retry_after_sec = res.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok());
+            spotify_body = res.text().await.ok();
+        }
+    }
+
+    let room_cp = {
+        let rooms = state.rooms.read().await;
+        rooms.get(&code_upper).and_then(|r| r.currently_playing.clone())
+    };
+
+    let (rate_limited, wait_secs) = crate::player_sync::is_rate_limited();
+    let diagnosis = if rate_limited || spotify_status == Some(429) {
+        let wait = wait_secs.max(retry_after_sec.unwrap_or(0)).max(15);
+        format!(
+            "RATE LIMIT (HTTP 429): Spotify hat vorübergehend zu viele Anfragen erhalten. Cooldown aktiv für noch ca. {} Sekunden. Bitte kurz warten, danach synchronisiert sich die Musik automatisch!",
+            wait
+        )
+    } else if !has_session {
+        "FEHLER: Der Host dieses Raums ist aktuell nicht mit Spotify angemeldet (Sitzung fehlt). Bitte melde dich mit Spotify an!".to_string()
+    } else if !has_token {
+        "FEHLER: Spotify Access Token konnte nicht erneuert werden.".to_string()
+    } else if spotify_status == Some(204) {
+        "HINWEIS: Spotify antwortet mit 204 No Content. Das bedeutet: Auf dem Spotify-Account des Hosts ist aktuell kein Song aktiv (Player pausiert, geschlossen oder privater Modus aktiv). Bitte starte einen Song in der Spotify-App auf deinem PC oder Handy!".to_string()
+    } else if spotify_status == Some(200) {
+        "OK: Spotify meldet aktive Wiedergabe.".to_string()
+    } else {
+        "UNBEKANNT: Prüfe die Spotify-Antwort im Feld 'spotify_response'.".to_string()
+    };
+
+    Ok(Json(serde_json::json!({
+        "room_code": code_upper,
+        "host_id": host_id,
+        "host_has_session": has_session,
+        "host_has_valid_token": has_token,
+        "spotify_http_status": spotify_status,
+        "retry_after_seconds": retry_after_sec,
+        "spotify_response": spotify_body,
+        "room_currently_playing": room_cp,
+        "diagnosis": diagnosis
+    })))
+}
+
 
